@@ -90,7 +90,7 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
         user_email: Annotated[str | None, Field(description="Only events of this user (email / UPN).")] = None,
         start_date: StartDate = None,
         end_date: EndDate = None,
-        size: Annotated[int | None, Field(description="Events to return (default 50).", ge=1, le=1000)] = None,
+        size: Annotated[int | None, Field(description="Events to return (default 50, max 200).", ge=1, le=200)] = None,
         from_: Annotated[int | None, Field(alias="from", description="Events to skip.", ge=0)] = None,
         time_sort: Annotated[Literal["asc", "desc"] | None, Field(description="Order by event time.")] = None,
         verbose: Verbose = None,

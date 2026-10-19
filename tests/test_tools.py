@@ -188,3 +188,9 @@ def test_shape_events_trims_elasticsearch_hits():
 
 def test_shape_events_verbose_returns_raw():
     assert shape_events([EVENT], True) == [EVENT]
+
+
+def test_events_query_size_capped_at_200(tools):
+    schema = tools["saas_alerts_events_query"].inputSchema["properties"]["size"]
+    maxima = [schema.get("maximum")] + [option.get("maximum") for option in schema.get("anyOf", [])]
+    assert 200 in maxima and not any(m and m > 200 for m in maxima)

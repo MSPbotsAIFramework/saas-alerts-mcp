@@ -213,8 +213,8 @@ async def test_customer_unknown_field_rejected(monkeypatch):
 
 async def test_customer_update_is_patch(monkeypatch):
     rec = Recorder({"PATCH customers/c1": {"id": "c1"}})
-    await _call(monkeypatch, rec, "saas_alerts_customers_update", {"customer_id": "c1", "body": {"name": "Acme"}})
-    assert body(rec.calls("PATCH", "customers/c1")[0]) == {"name": "Acme"}
+    await _call(monkeypatch, rec, "saas_alerts_customers_update", {"customer_id": "c1", "body": {"name": "Example Client"}})
+    assert body(rec.calls("PATCH", "customers/c1")[0]) == {"name": "Example Client"}
 
 
 @pytest.mark.parametrize(
