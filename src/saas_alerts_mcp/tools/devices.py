@@ -38,7 +38,9 @@ def _ids(values: list[str]) -> list[str]:
     ids = [v.strip() for v in values if v and v.strip()]
     if not ids:
         raise ValueError("organization_ids must contain at least one id.")
-    return ids
+    # One id goes out as a plain string, which the API rejects ("organizationIds" must be an array);
+    # repeated, it arrives as an array. Verified on a live account: same devices, no duplicates.
+    return ids * 2 if len(ids) == 1 else ids
 
 
 def register(mcp: FastMCP, client_factory: ClientFactory) -> None:

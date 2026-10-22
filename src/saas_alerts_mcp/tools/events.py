@@ -39,8 +39,9 @@ AlertStatus = Annotated[Literal["critical", "medium", "low"] | None, Field(descr
 EventTypes = Annotated[
     list[str] | None,
     Field(
-        description="Event types (jointType), e.g. login.failure, login.failure.3.attempts, file.sharing.external, "
-        "oauth.granted.permission, new.device, user.promoted.to.admin, outside.own.location, account.locks."
+        description="Event types: the exact, full jointType value, e.g. login.failure, login.success, "
+        "enterprise.application.login.success, file.sharing.external, oauth.granted.permission, new.device, "
+        "user.promoted.to.admin, outside.own.location, account.locks."
     ),
 ]
 StartDate = Annotated[str | None, Field(description="Range start: ISO 8601 or epoch milliseconds.")]
@@ -98,6 +99,33 @@ def _recommendation_records(payload: Any) -> list[dict]:
     ]
 
 
+def _es_query(
+    customer_id: str | None,
+    alert_status: str | None,
+    types: list[str],
+    start_date: str | None,
+    end_date: str | None,
+    user_email: str | None = None,
+) -> dict:
+    """The same filters as GET reports/events, as an Elasticsearch bool query.
+
+    Field names checked on a live account: customer.id, alertStatus, jointType, user.name, time.
+    """
+    filters: list[dict] = []
+    if customer_id and customer_id.strip():
+        filters.append({"term": {"customer.id": customer_id.strip()}})
+    if alert_status:
+        filters.append({"term": {"alertStatus": alert_status}})
+    if types:
+        filters.append({"terms": {"jointType": types}})
+    if user_email and user_email.strip():
+        filters.append({"term": {"user.name": user_email.strip()}})
+    window = compact({"gte": to_iso(start_date, "start_date"), "lte": to_iso(end_date, "end_date")})
+    if window:
+        filters.append({"range": {"time": window}})
+    return {"bool": {"filter": filters}} if filters else {"match_all": {}}
+
+
 def _search_body(search: dict[str, Any], scroll: str | None = None, size: int | None = None) -> dict:
     if not isinstance(search, dict) or "query" not in search:
         raise ValueError('query must be an Elasticsearch search body containing "query".')
@@ -129,16 +157,33 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
 
         async def action(client: SaasAlertsClient) -> Any:
             page_size, start = size or 50, from_ or 0
-            params = _filters(customer_id, alert_status, event_type, start_date, end_date, user_email) | compact(
-                {"size": page_size, "from": from_, "timeSort": time_sort}
-            )
-            events = as_list(await client.get("reports/events", params))
+            types = [t.strip() for t in event_type or [] if t.strip()]
+            total = None
+            if time_sort or len(types) > 1:
+                # GET reports/events ignores timeSort and rejects several eventType values; the
+                # Elasticsearch search sorts and filters correctly (checked against events_count).
+                body = {"size": page_size, "from": start, "query": _es_query(customer_id, alert_status, types, start_date, end_date, user_email)}
+                if time_sort:
+                    body["sort"] = [{"time": time_sort}]
+                payload = await client.post("reports/events/query", _search_body(body))
+                hits = payload.get("hits") if isinstance(payload, dict) and isinstance(payload.get("hits"), dict) else {}
+                events = [h["_source"] for h in hits.get("hits") or [] if isinstance(h, dict) and isinstance(h.get("_source"), dict)]
+                found = hits.get("total")
+                if isinstance(found, dict) and found.get("relation") == "eq" and isinstance(found.get("value"), int):
+                    total = found["value"]
+            else:
+                params = _filters(customer_id, alert_status, types or None, start_date, end_date, user_email) | compact(
+                    {"size": page_size, "from": from_}
+                )
+                events = as_list(await client.get("reports/events", params))
             shaped = shape_events(events, False)
             result = {"events": events if verbose else shaped["events"], "count": len(events)}
             if not verbose:
                 result["note"] = shaped["note"]
-            # The API returns a plain array: a full page means there may be more.
-            result["has_more"] = len(events) >= page_size
+            # GET returns a plain array: a full page means there may be more.
+            result["has_more"] = start + len(events) < total if total is not None else len(events) >= page_size
+            if total is not None:
+                result["total"] = total
             if result["has_more"]:
                 result["next_from"] = start + len(events)
             return result | {"_resume": {"key": "next_from", "start": start}}
@@ -156,7 +201,13 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
         """Count security events matching filters without fetching them."""
 
         async def action(client: SaasAlertsClient) -> Any:
-            return await client.get("reports/events/count", _filters(customer_id, alert_status, event_type, start_date, end_date))
+            types = [t.strip() for t in event_type or [] if t.strip()]
+            if len(types) > 1:
+                # The GET count rejects several eventType values; the Elasticsearch count does not.
+                query = {"query": _es_query(customer_id, alert_status, types, start_date, end_date)}
+                counted = await client.post("reports/events/count/query", _search_body(query))
+                return {"total": counted.get("count") if isinstance(counted, dict) else counted}
+            return await client.get("reports/events/count", _filters(customer_id, alert_status, types or None, start_date, end_date))
 
         return await run_tool("saas_alerts_events_count", client_factory, action)
 

@@ -130,19 +130,20 @@ EVENT = {"time": "2026-01-01T00:00:00Z", "jointType": "login.failure", "alertSta
 
 
 async def test_events_query_params(monkeypatch):
+    # No sort and at most one type: GET reports/events with the documented query parameters.
     rec = Recorder({"reports/events": [EVENT]})
-    args = {"customer_id": "c1", "alert_status": "critical", "event_type": ["login.failure", "new.device"],
+    args = {"customer_id": "c1", "alert_status": "critical", "event_type": ["login.failure"],
             "user_email": "user@example.com", "start_date": "1767225600000", "end_date": "2026-01-02",
-            "from": 20, "size": 10, "time_sort": "desc"}
+            "from": 20, "size": 10}
     result = await _call(monkeypatch, rec, "saas_alerts_events_query", args)
     params = rec.requests[0].url.params
     assert params["customerId"] == "c1"
     assert params["alertStatus"] == "critical"
-    assert params.get_list("eventType") == ["login.failure", "new.device"]
+    assert params.get_list("eventType") == ["login.failure"]
     assert params["userEmail"] == "user@example.com"
     assert params["start"] == "2026-01-01T00:00:00.000Z"
     assert params["end"] == "2026-01-02T00:00:00.000Z"
-    assert (params["from"], params["size"], params["timeSort"]) == ("20", "10", "desc")
+    assert (params["from"], params["size"]) == ("20", "10") and "timeSort" not in params
     assert result["count"] == 1 and "raw" not in result["events"][0]
 
 
@@ -478,3 +479,100 @@ async def test_recommended_actions_too_many_to_fit_continue_by_next_offset(monke
             break
         assert calls < 100
     assert cut > 0 and seen == [f"type.{i:03d}" for i in range(800)]
+
+
+
+# ---- PRD-21121: one organization id ------------------------------------------------------------------------
+# Live check: one id as a plain query value gets 422 ("organizationIds" must be an array); the same id twice
+# returns that organization's devices with no duplicates (353 + 319 = 672 for two organizations).
+
+@pytest.mark.parametrize(
+    "tool,path",
+    [
+        ("saas_alerts_devices_list_mapped", "reports/unify-mapped-devices-by-account"),
+        ("saas_alerts_devices_list_unmapped", "reports/unify-unmapped-devices-by-account"),
+        ("saas_alerts_devices_list_ignored", "reports/unify-ignored-devices"),
+    ],
+)
+async def test_one_organization_id_is_sent_as_an_array(monkeypatch, tool, path):
+    rec = Recorder({path: [{"_id": "d1"}]})
+    await _call(monkeypatch, rec, tool, {"organization_ids": ["tfDpgZTTv3XFsqJF1Tmc"]})
+    assert rec.requests[-1].url.params.get_list("organizationIds") == ["tfDpgZTTv3XFsqJF1Tmc"] * 2
+    await _call(monkeypatch, rec, tool, {"organization_ids": ["a", "b"]})
+    assert rec.requests[-1].url.params.get_list("organizationIds") == ["a", "b"]
+
+
+# ---- PRD-21122: time_sort and several event types go through the Elasticsearch search ---------------------
+# Live checks: GET ignores timeSort and rejects several eventType values (422); the search sorts with
+# "sort": [{"time": "desc"}] and its filters match events_count (critical 23, login.success 3,558,
+# customer 6,032, user 41).
+
+def _es_hits(rows, total=None):
+    return {"hits": {"total": {"value": len(rows) if total is None else total, "relation": "eq"},
+                     "hits": [{"_id": r["eventId"], "_source": r} for r in rows]}}
+
+
+async def test_time_sort_uses_the_search_with_the_same_filters(monkeypatch):
+    rec = Recorder({"POST reports/events/query": _es_hits([EVENT | {"eventId": "e1"}], total=40)})
+    args = {"customer_id": "c1", "alert_status": "critical", "event_type": ["login.failure"], "user_email": "u@example.com",
+            "start_date": "2026-10-21T00:00:00Z", "end_date": "2026-10-22T00:00:00Z", "from": 10, "size": 5, "time_sort": "desc"}
+    result = await _call(monkeypatch, rec, "saas_alerts_events_query", args)
+    sent = body(rec.requests[0])["body"]
+    assert sent["sort"] == [{"time": "desc"}] and (sent["from"], sent["size"]) == (10, 5)
+    assert sent["query"] == {"bool": {"filter": [
+        {"term": {"customer.id": "c1"}},
+        {"term": {"alertStatus": "critical"}},
+        {"terms": {"jointType": ["login.failure"]}},
+        {"term": {"user.name": "u@example.com"}},
+        {"range": {"time": {"gte": "2026-10-21T00:00:00.000Z", "lte": "2026-10-22T00:00:00.000Z"}}},
+    ]}}
+    assert not rec.calls("GET", "reports/events")
+    assert (result["total"], result["count"], result["has_more"], result["next_from"]) == (40, 1, True, 11)
+
+
+async def test_several_event_types_use_the_search_without_a_sort(monkeypatch):
+    rec = Recorder({"POST reports/events/query": _es_hits([EVENT | {"eventId": "e1"}])})
+    await _call(monkeypatch, rec, "saas_alerts_events_query", {"event_type": ["login.success", "login.failure"]})
+    sent = body(rec.requests[0])["body"]
+    assert "sort" not in sent and sent["query"] == {"bool": {"filter": [{"terms": {"jointType": ["login.success", "login.failure"]}}]}}
+
+
+async def test_time_sort_without_filters_matches_everything(monkeypatch):
+    rec = Recorder({"POST reports/events/query": _es_hits([])})
+    result = await _call(monkeypatch, rec, "saas_alerts_events_query", {"time_sort": "asc"})
+    assert body(rec.requests[0])["body"]["query"] == {"match_all": {}}
+    assert (result["count"], result["has_more"], result["total"]) == (0, False, 0)
+
+
+async def test_sorted_pages_cut_to_fit_continue_from_next_from(monkeypatch):
+    rows = [{"eventId": f"e{i:04d}", "time": "2026-10-21T00:00:00Z", "jointType": "x", "jointDesc": "d" * 300,
+             **{f"field{k}": f"value {k}" for k in range(30)}} for i in range(420)]
+
+    def reply(request):
+        sent = body(request)["body"]
+        return httpx.Response(200, json=_es_hits(rows[sent["from"] : sent["from"] + sent["size"]], total=len(rows)))
+
+    rec = Recorder({"POST reports/events/query": reply})
+    ids, start, cut, calls = [], None, 0, 0
+    while True:
+        args = {"size": 200, "time_sort": "desc", "verbose": True} | ({} if start is None else {"from": start})
+        out = await _call(monkeypatch, rec, "saas_alerts_events_query", args)
+        calls += 1
+        assert "retry_page_size" not in out
+        cut += bool(out.get("truncated"))
+        ids += [e["eventId"] for e in out["events"]]
+        start = out.get("next_from")
+        if start is None:
+            break
+        assert calls < 100
+    assert cut > 0 and ids == [r["eventId"] for r in rows]
+
+
+async def test_count_with_several_types_uses_the_search_count(monkeypatch):
+    rec = Recorder({"POST reports/events/count/query": {"count": 16677, "_shards": {"total": 1}},
+                    "reports/events/count": {"total": 3558}})
+    several = await _call(monkeypatch, rec, "saas_alerts_events_count", {"event_type": ["login.success", "login.failure"]})
+    assert several == {"total": 16677}
+    assert body(rec.requests[0])["body"]["query"] == {"bool": {"filter": [{"terms": {"jointType": ["login.success", "login.failure"]}}]}}
+    one = await _call(monkeypatch, rec, "saas_alerts_events_count", {"event_type": ["login.success"]})
+    assert one == {"total": 3558} and rec.requests[-1].url.params.get_list("eventType") == ["login.success"]
