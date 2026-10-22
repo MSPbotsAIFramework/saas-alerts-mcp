@@ -24,7 +24,8 @@ from typing import Annotated, Any
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from .._json import dump_json_capped, error_envelope
+from .._json import _SHRINK_STEPS, MAX_CHARS, _shrink, dump_json_capped, error_envelope
+from .._json import compact as compact_json
 from ..api_client import SaasAlertsClient, SaasAlertsError
 
 logger = logging.getLogger("saas_alerts_mcp.tools")
@@ -84,6 +85,67 @@ def from_alias(function: Callable[..., Awaitable[str]]) -> Callable[..., Awaitab
 
 def compact(values: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in values.items() if v is not None}
+
+
+Offset = Annotated[
+    int | None, Field(description="Record position to start from (0-based); pass next_offset from the previous result.", ge=0)
+]
+Limit = Annotated[int | None, Field(description="Records to return (default: as many as fit the response size limit).", ge=1)]
+
+
+def local_page(rows: list, key: str, offset: int | None, limit: int | None, **extra: Any) -> dict:
+    """Page a list the API returns in full: ``rows[offset:offset+limit]`` plus paging fields.
+
+    next_offset continues right after the last record returned, also when the result is cut to
+    fit the size limit (these endpoints take no page size, so nothing else could continue it).
+    """
+    start = offset or 0
+    shown = rows[start:] if limit is None else rows[start : start + limit]
+    more = start + len(shown) < len(rows)
+    result: dict[str, Any] = {**extra, key: shown, "count": len(shown), "total": len(rows), "offset": start, "has_more": more}
+    if more:
+        result["next_offset"] = start + len(shown)
+    return result | {"_resume": {"key": "next_offset", "start": start}}
+
+
+def es_capped(payload: dict) -> str:
+    """Cap an Elasticsearch response whose records sit in the nested ``hits.hits``.
+
+    The shared size limit only cuts top-level lists. Here long fields are shortened first; if the
+    hits still do not fit, the first ones that fit are returned and ``_scroll_id`` is left out,
+    since following it would skip the cut hits (a scroll cannot go back).
+    """
+    text = compact_json(payload)
+    if len(text) <= MAX_CHARS:
+        return text
+    hits = payload.get("hits") if isinstance(payload.get("hits"), dict) else {}
+    items = hits.get("hits") if isinstance(hits.get("hits"), list) else []
+    shortened = items
+    for text_limit, list_limit in _SHRINK_STEPS:
+        shortened = [_shrink(h, text_limit, list_limit) for h in items]
+        candidate = payload | {"hits": hits | {"hits": shortened}, "fields_truncated": True}
+        if len(compact_json(candidate)) <= MAX_CHARS:
+            return compact_json(candidate)
+
+    def build(n: int) -> dict:
+        rest = {k: v for k, v in payload.items() if k != "_scroll_id"}
+        return rest | {
+            "hits": hits | {"hits": shortened[:n]},
+            "truncated": True,
+            "has_more": True,
+            "original_count": len(items),
+            "note": f"Only {n} of {len(items)} hits fit the response size limit. _scroll_id was left out because "
+            "following it would skip the rest; run the search again with a smaller size in the body.",
+        }
+
+    lo, hi = 0, len(items)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(compact_json(build(mid))) <= MAX_CHARS:
+            lo = mid
+        else:
+            hi = mid - 1
+    return compact_json(build(lo)) if lo > 0 else dump_json_capped(payload)
 
 
 def as_list(payload: Any) -> list:

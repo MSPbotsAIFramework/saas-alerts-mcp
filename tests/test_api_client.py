@@ -155,7 +155,7 @@ async def test_events_query_default_size(monkeypatch):
 async def test_events_query_verbose_is_raw(monkeypatch):
     rec = Recorder({"reports/events": [EVENT]})
     result = await _call(monkeypatch, rec, "saas_alerts_events_query", {"verbose": True})
-    assert result == [EVENT]
+    assert result["events"] == [EVENT] and result["has_more"] is False  # raw events, with paging fields
 
 
 async def test_events_count_has_no_paging(monkeypatch):
@@ -299,3 +299,182 @@ async def test_status(monkeypatch):
     result = await _call(monkeypatch, rec, "saas_alerts_status", {})
     assert result["connected"] is True
     assert rec.calls("GET", "reports/msp-user")
+
+
+
+# ---- PRD-21123: whole lists continue by offset -------------------------------------------------------------
+# Checklist: cut lists walked by next_offset return every record once; offset inside / limit / past the end;
+# no offset returns every record as before; no retry_page_size when next_offset is exact.
+
+def _wide(i):
+    return {"id": f"r{i:04d}", "name": f"Record {i}", **{f"field{k}": f"value {k}" for k in range(40)}}
+
+
+ORGS = ["tfDpgZTTv3XFsqJF1Tmc", "second-org"]
+WHOLE_LISTS = [
+    ("saas_alerts_customers_list", "customers", "customers", {}),
+    ("saas_alerts_users_list_partner", "reports/partnerUsers", "users", {}),
+    ("saas_alerts_users_list_by_customer", "reports/users", "users", {"customer_id": "c1"}),
+    ("saas_alerts_reports_list_scheduled", "reports/scheduled-report", "reports", {}),
+    ("saas_alerts_devices_list_orgs", "reports/devices-organizations", "organizations", {}),
+    ("saas_alerts_devices_list_mapped", "reports/unify-mapped-devices-by-account", "devices", {"organization_ids": ORGS}),
+    ("saas_alerts_devices_list_unmapped", "reports/unify-unmapped-devices-by-account", "devices", {"organization_ids": ORGS}),
+    ("saas_alerts_devices_list_ignored", "reports/unify-ignored-devices", "devices", {"organization_ids": ORGS}),
+]
+
+
+@pytest.mark.parametrize("tool,path,key,args", WHOLE_LISTS)
+async def test_cut_whole_lists_continue_by_next_offset(monkeypatch, tool, path, key, args):
+    rows = [_wide(i) for i in range(134)]
+    rec = Recorder({path: rows})
+    ids, cut, call_args, calls = [], 0, dict(args), 0
+    while True:
+        out = await _call(monkeypatch, rec, tool, call_args)
+        calls += 1
+        assert "retry_page_size" not in out
+        cut += bool(out.get("truncated"))
+        ids += [r["id"] for r in out[key]]
+        if out.get("next_offset") is None:
+            break
+        call_args = args | {"offset": out["next_offset"]}
+        assert calls < 60
+    assert cut > 0 and ids == [r["id"] for r in rows]
+
+
+@pytest.mark.parametrize("tool,path,key,args", WHOLE_LISTS)
+async def test_offset_limit_and_past_the_end(monkeypatch, tool, path, key, args):
+    rows = [{"id": f"r{i}"} for i in range(38)]
+    rec = Recorder({path: rows})
+    page = await _call(monkeypatch, rec, tool, args | {"offset": 10, "limit": 3})
+    assert [r["id"] for r in page[key]] == ["r10", "r11", "r12"]
+    assert (page["next_offset"], page["total"], page["has_more"]) == (13, 38, True)
+    past = await _call(monkeypatch, rec, tool, args | {"offset": 100})
+    assert (past[key], past["has_more"], past.get("next_offset")) == ([], False, None)
+    whole = await _call(monkeypatch, rec, tool, args)
+    assert [r["id"] for r in whole[key]] == [r["id"] for r in rows] and whole["count"] == 38
+
+
+# ---- PRD-21124: recommended actions, one record per event type --------------------------------------------
+
+
+def _recommendations(n=120):
+    return {f"type.{i:03d}": {"title": f"Action {i}", "recommendation": "Do this. " * 40} for i in range(n)}
+
+
+async def test_recommended_actions_walk_every_event_type(monkeypatch):
+    rec = Recorder({"reports/alert-recommended-actions": _recommendations()})
+    seen, offset, cut, calls = [], None, 0, 0
+    while True:
+        out = await _call(monkeypatch, rec, "saas_alerts_recommended_actions", {} if offset is None else {"offset": offset})
+        calls += 1
+        assert "Result too large" not in json.dumps(out) and "retry_page_size" not in out
+        cut += bool(out.get("truncated") or out.get("fields_truncated"))
+        seen += [r["event_type"] for r in out["recommended_actions"]]
+        offset = out.get("next_offset")
+        if offset is None:
+            break
+        assert calls < 60
+    assert cut > 0 and seen == [f"type.{i:03d}" for i in range(120)]
+    # A full list may shorten long texts to fit; one event type (or a small limit) comes back in full.
+    one = await _call(monkeypatch, rec, "saas_alerts_recommended_actions", {"event_type": "type.042"})
+    assert one["recommended_actions"][0]["recommendation"] == "Do this. " * 40
+    few = await _call(monkeypatch, rec, "saas_alerts_recommended_actions", {"offset": 40, "limit": 10})
+    assert all(r["recommendation"] == "Do this. " * 40 for r in few["recommended_actions"])
+
+
+async def test_recommended_action_for_one_event_type(monkeypatch):
+    rec = Recorder({"reports/alert-recommended-actions": _recommendations()})
+    out = await _call(monkeypatch, rec, "saas_alerts_recommended_actions", {"event_type": "TYPE.007"})
+    assert [r["event_type"] for r in out["recommended_actions"]] == ["type.007"]
+    assert out["recommended_actions"][0]["title"] == "Action 7"
+    none = await _call(monkeypatch, rec, "saas_alerts_recommended_actions", {"event_type": "no.such.type"})
+    assert (none["recommended_actions"], none["total"]) == ([], 0)
+
+
+async def test_recommended_actions_as_a_list_keep_their_type(monkeypatch):
+    rec = Recorder({"reports/alert-recommended-actions": [{"jointType": "login.failure", "action": "Reset"}]})
+    out = await _call(monkeypatch, rec, "saas_alerts_recommended_actions", {"event_type": "login.failure"})
+    assert out["recommended_actions"] == [{"event_type": "login.failure", "jointType": "login.failure", "action": "Reset"}]
+
+
+# ---- PRD-21125: events_query says whether more exist and where to continue ---------------------------------
+
+
+def _events_api(rows):
+    def reply(request):
+        start = int(request.url.params.get("from", 0))
+        size = int(request.url.params.get("size", 50))
+        return httpx.Response(200, json=rows[start : start + size])
+
+    return reply
+
+
+async def test_events_query_reports_has_more_and_next_from(monkeypatch):
+    rows = [{"time": f"2026-10-21T00:{i // 60:02d}:{i % 60:02d}Z", "jointType": "login.success", "eventId": f"e{i}"} for i in range(12)]
+    rec = Recorder({"reports/events": _events_api(rows)})
+    full = await _call(monkeypatch, rec, "saas_alerts_events_query", {"size": 5})
+    assert (full["count"], full["has_more"], full["next_from"]) == (5, True, 5)
+    last = await _call(monkeypatch, rec, "saas_alerts_events_query", {"size": 5, "from": 10})
+    assert (last["count"], last["has_more"], last.get("next_from")) == (2, False, None)
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+async def test_cut_event_pages_continue_from_next_from(monkeypatch, verbose):
+    rows = [{"eventId": f"e{i:04d}", "time": "2026-10-21T00:00:00Z", "jointType": "x",
+             "jointDesc": "d" * 300, **{f"field{k}": f"value {k}" for k in range(30)}} for i in range(450)]
+    rec = Recorder({"reports/events": _events_api(rows)})
+    ids, start, cut, calls = [], None, 0, 0
+    while True:
+        args = {"size": 200, "verbose": verbose} | ({} if start is None else {"from": start})
+        out = await _call(monkeypatch, rec, "saas_alerts_events_query", args)
+        calls += 1
+        assert "retry_page_size" not in out
+        cut += bool(out.get("truncated"))
+        ids += [e["eventId"] for e in out["events"]]
+        start = out.get("next_from")
+        if start is None:
+            break
+        assert calls < 100
+    assert cut > 0 and ids == [r["eventId"] for r in rows]
+
+
+# ---- Elasticsearch / scroll: cut hits drop _scroll_id -------------------------------------------------------
+
+
+def _es_reply(n, scroll="scroll-1"):
+    hits = [{"_id": f"h{i}", "_source": {"eventId": f"h{i}", "time": "2026-10-21T00:00:00Z", "jointType": "x",
+                                         **{f"field{k}": f"value {k}" for k in range(40)}}} for i in range(n)]
+    return {"_scroll_id": scroll, "took": 3, "hits": {"total": {"value": 5000}, "hits": hits}}
+
+
+@pytest.mark.parametrize(
+    "tool,route,args",
+    [
+        ("saas_alerts_events_query_advanced", "POST reports/events/query", {"query": {"query": {"match_all": {}}}, "verbose": True}),
+        ("saas_alerts_events_scroll", "POST reports/events/scroll", {"scroll_id": "scroll-0", "verbose": True}),
+    ],
+)
+async def test_cut_es_hits_drop_the_scroll_id(monkeypatch, tool, route, args):
+    rec = Recorder({route: _es_reply(300)})
+    out = await _call(monkeypatch, rec, tool, args)
+    assert out["truncated"] is True and 0 < len(out["hits"]["hits"]) < 300 and out["original_count"] == 300
+    assert "_scroll_id" not in out and "smaller size" in out["note"]
+    assert len(json.dumps(out, separators=(",", ":"))) <= 20_000
+    small = Recorder({route: _es_reply(3)})
+    whole = await _call(monkeypatch, small, tool, args)
+    assert whole["_scroll_id"] == "scroll-1" and len(whole["hits"]["hits"]) == 3 and "truncated" not in whole
+
+
+async def test_recommended_actions_too_many_to_fit_continue_by_next_offset(monkeypatch):
+    rec = Recorder({"reports/alert-recommended-actions": _recommendations(800)})
+    seen, offset, cut, calls = [], None, 0, 0
+    while True:
+        out = await _call(monkeypatch, rec, "saas_alerts_recommended_actions", {} if offset is None else {"offset": offset})
+        calls += 1
+        cut += bool(out.get("truncated"))
+        seen += [r["event_type"] for r in out["recommended_actions"]]
+        offset = out.get("next_offset")
+        if offset is None:
+            break
+        assert calls < 100
+    assert cut > 0 and seen == [f"type.{i:03d}" for i in range(800)]

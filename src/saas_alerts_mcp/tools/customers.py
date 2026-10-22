@@ -27,7 +27,10 @@ from ._common import (
     ClientFactory,
     Confirm,
     CustomerId,
+    Limit,
+    Offset,
     as_list,
+    local_page,
     run_tool,
 )
 
@@ -55,12 +58,11 @@ def _checked(body: dict[str, Any], allowed: set[str], what: str) -> dict[str, An
 
 def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
     @mcp.tool(annotations=READ_ONLY)
-    async def saas_alerts_customers_list() -> str:
+    async def saas_alerts_customers_list(offset: Offset = None, limit: Limit = None) -> str:
         """List customers (monitored organisations) with their ids and connected products."""
 
         async def action(client: SaasAlertsClient) -> dict:
-            customers = as_list(await client.get("customers"))
-            return {"customers": customers, "count": len(customers)}
+            return local_page(as_list(await client.get("customers")), "customers", offset, limit)
 
         return await run_tool("saas_alerts_customers_list", client_factory, action)
 
@@ -133,11 +135,11 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
         return await run_tool("saas_alerts_customers_set_account_whitelists", client_factory, action)
 
     @mcp.tool(annotations=READ_ONLY)
-    async def saas_alerts_users_list_by_customer(customer_id: CustomerId) -> str:
+    async def saas_alerts_users_list_by_customer(customer_id: CustomerId, offset: Offset = None, limit: Limit = None) -> str:
         """List a customer's monitored SaaS user accounts."""
 
         async def action(client: SaasAlertsClient) -> dict:
             users = as_list(await client.get("reports/users", {"customerId": customer_id.strip()}))
-            return {"users": users, "count": len(users)}
+            return local_page(users, "users", offset, limit)
 
         return await run_tool("saas_alerts_users_list_by_customer", client_factory, action)

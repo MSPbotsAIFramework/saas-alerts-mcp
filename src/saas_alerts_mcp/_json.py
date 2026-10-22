@@ -90,6 +90,7 @@ def dump_json_capped(data: Any, max_chars: int = MAX_CHARS) -> str:
                 candidate["retry_page_size"] = max(n, 1)
                 if resume and isinstance(resume.get("start"), int) and resume.get("key"):
                     candidate[resume["key"]] = resume["start"] + n
+                    del candidate["retry_page_size"]  # the continuation field is exact; no retry needed
                     candidate["note"] = (
                         f"Only {n} of {len(items)} records fit the response size limit; "
                         f"continue from {resume['key']}, which starts right after the last record returned."
@@ -145,6 +146,7 @@ _CONTINUATION_KEYS = frozenset(
     {
         "next_page", "next_offset", "next_skip", "next_cursor", "next_page_token", "next_token",
         "starting_after", "next", "next_link", "nextPageAfter", "next_start", "nextPage", "next_page_url",
+        "next_from", "_scroll_id",
     }
 )
 _RESUME = "_resume"

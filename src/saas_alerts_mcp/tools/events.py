@@ -22,10 +22,14 @@ from ..api_client import SaasAlertsClient
 from ._common import (
     READ_ONLY,
     ClientFactory,
+    Limit,
+    Offset,
     Verbose,
     as_list,
     compact,
+    es_capped,
     from_alias,
+    local_page,
     run_tool,
     shape_events,
     to_iso,
@@ -72,6 +76,28 @@ def _filters(
     )
 
 
+def _es(result: Any) -> Any:
+    """Elasticsearch responses keep their records in hits.hits: cap them there (see es_capped)."""
+    if isinstance(result, dict) and isinstance(result.get("hits"), dict) and isinstance(result["hits"].get("hits"), list):
+        return es_capped(result)
+    return result
+
+
+def _recommendation_records(payload: Any) -> list[dict]:
+    """One record per event type, whether the API sends a mapping or a list."""
+    if isinstance(payload, dict) and not any(k in payload for k in ("event_type", "eventType", "jointType")):
+        records = []
+        for key, value in payload.items():
+            body = value if isinstance(value, dict) else {"recommended_action": value}
+            records.append({"event_type": key, **body})
+        return records
+    rows = as_list(payload)
+    return [
+        ({"event_type": r.get("event_type") or r.get("eventType") or r.get("jointType"), **r} if isinstance(r, dict) else {"recommended_action": r})
+        for r in rows
+    ]
+
+
 def _search_body(search: dict[str, Any], scroll: str | None = None, size: int | None = None) -> dict:
     if not isinstance(search, dict) or "query" not in search:
         raise ValueError('query must be an Elasticsearch search body containing "query".')
@@ -95,13 +121,27 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
         time_sort: Annotated[Literal["asc", "desc"] | None, Field(description="Order by event time.")] = None,
         verbose: Verbose = None,
     ) -> str:
-        """Query security events by customer, severity, type, user and time range."""
+        """Query security events by customer, severity, type, user and time range.
+
+        has_more / next_from say whether to call again (pass next_from as from); the API gives no total,
+        use saas_alerts_events_count for it.
+        """
 
         async def action(client: SaasAlertsClient) -> Any:
+            page_size, start = size or 50, from_ or 0
             params = _filters(customer_id, alert_status, event_type, start_date, end_date, user_email) | compact(
-                {"size": size or 50, "from": from_, "timeSort": time_sort}
+                {"size": page_size, "from": from_, "timeSort": time_sort}
             )
-            return shape_events(as_list(await client.get("reports/events", params)), verbose)
+            events = as_list(await client.get("reports/events", params))
+            shaped = shape_events(events, False)
+            result = {"events": events if verbose else shaped["events"], "count": len(events)}
+            if not verbose:
+                result["note"] = shaped["note"]
+            # The API returns a plain array: a full page means there may be more.
+            result["has_more"] = len(events) >= page_size
+            if result["has_more"]:
+                result["next_from"] = start + len(events)
+            return result | {"_resume": {"key": "next_from", "start": start}}
 
         return await run_tool("saas_alerts_events_query", client_factory, action)
 
@@ -131,7 +171,7 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
         """Run an Elasticsearch search over the events index (filters, aggregations, sorting)."""
 
         async def action(client: SaasAlertsClient) -> Any:
-            return shape_events(await client.post("reports/events/query", _search_body(query, scroll)), verbose)
+            return _es(shape_events(await client.post("reports/events/query", _search_body(query, scroll)), verbose))
 
         return await run_tool("saas_alerts_events_query_advanced", client_factory, action)
 
@@ -154,15 +194,27 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
 
         async def action(client: SaasAlertsClient) -> Any:
             body = {"scrollId": scroll_id.strip(), "scroll": scroll or "1m"}
-            return shape_events(await client.post("reports/events/scroll", body), verbose)
+            return _es(shape_events(await client.post("reports/events/scroll", body), verbose))
 
         return await run_tool("saas_alerts_events_scroll", client_factory, action)
 
     @mcp.tool(annotations=READ_ONLY)
-    async def saas_alerts_recommended_actions() -> str:
-        """List the recommended response for each event type (what an analyst should do)."""
+    async def saas_alerts_recommended_actions(
+        event_type: Annotated[str | None, Field(description="Only this event type (jointType), e.g. login.failure.")] = None,
+        offset: Offset = None,
+        limit: Limit = None,
+    ) -> str:
+        """List the recommended response for each event type (what an analyst should do).
+
+        One record per event type; pass event_type for one, or continue with offset=next_offset. A full
+        list may shorten long texts to fit; event_type or a small limit returns them in full.
+        """
 
         async def action(client: SaasAlertsClient) -> Any:
-            return as_list(await client.get("reports/alert-recommended-actions"))
+            records = _recommendation_records(await client.get("reports/alert-recommended-actions"))
+            if event_type and event_type.strip():
+                wanted = event_type.strip().lower()
+                records = [r for r in records if str(r.get("event_type", "")).lower() == wanted]
+            return local_page(records, "recommended_actions", offset, limit)
 
         return await run_tool("saas_alerts_recommended_actions", client_factory, action)

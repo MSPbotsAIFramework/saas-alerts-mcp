@@ -25,7 +25,10 @@ from ._common import (
     WRITES,
     ClientFactory,
     Confirm,
+    Limit,
+    Offset,
     as_list,
+    local_page,
     run_tool,
 )
 
@@ -84,12 +87,11 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
         return await run_tool("saas_alerts_users_get_msp", client_factory, action)
 
     @mcp.tool(annotations=READ_ONLY)
-    async def saas_alerts_users_list_partner() -> str:
+    async def saas_alerts_users_list_partner(offset: Offset = None, limit: Limit = None) -> str:
         """List the partner's own users (people who sign in to SaaS Alerts)."""
 
         async def action(client: SaasAlertsClient) -> dict:
-            users = as_list(await client.get("reports/partnerUsers"))
-            return {"users": users, "count": len(users)}
+            return local_page(as_list(await client.get("reports/partnerUsers")), "users", offset, limit)
 
         return await run_tool("saas_alerts_users_list_partner", client_factory, action)
 
@@ -116,12 +118,11 @@ def register(mcp: FastMCP, client_factory: ClientFactory) -> None:
         return await run_tool("saas_alerts_billing_get_details", client_factory, action)
 
     @mcp.tool(annotations=READ_ONLY)
-    async def saas_alerts_reports_list_scheduled() -> str:
+    async def saas_alerts_reports_list_scheduled(offset: Offset = None, limit: Limit = None) -> str:
         """List scheduled reports with their recipients and frequency."""
 
         async def action(client: SaasAlertsClient) -> dict:
-            reports = as_list(await client.get("reports/scheduled-report"))
-            return {"reports": reports, "count": len(reports)}
+            return local_page(as_list(await client.get("reports/scheduled-report")), "reports", offset, limit)
 
         return await run_tool("saas_alerts_reports_list_scheduled", client_factory, action)
 

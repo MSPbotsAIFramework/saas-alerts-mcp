@@ -34,6 +34,15 @@ A request to `/mcp` without the key gets HTTP 401.
 All tools return a JSON string. Event tools return triage fields only (time, type, severity,
 description, user, customer, product, IP, location) unless `verbose: true` is passed.
 
+Paging: `saas_alerts_events_query` returns `{events, count, has_more, next_from}` (also with `verbose`);
+pass `next_from` as `from` to continue; the API gives no total, use `saas_alerts_events_count`. Lists the
+API returns in full (customers, partner and customer users, scheduled reports, device organizations and
+the mapped / unmapped / ignored devices, recommended actions) take `offset` / `limit` and return
+`next_offset`. When a result is cut to fit the 20,000-character limit, `next_from` / `next_offset` start
+right after the last record returned. Elasticsearch results (`events_query_advanced`, `events_scroll`)
+that are cut leave out `_scroll_id`, which would skip the rest: run the search again with a smaller
+`size`. `saas_alerts_recommended_actions` returns one record per event type; pass `event_type` for one.
+
 | Tool | Purpose | Parameters (required in **bold**) |
 |---|---|---|
 | `saas_alerts_navigate` | Describe the tools of one area (changes nothing) | **domain** (`events`, `customers`, `users`, `devices`, `billing`, `reports`, `partner`) |
@@ -43,8 +52,8 @@ description, user, customer, product, IP, location) unless `verbose: true` is pa
 | `saas_alerts_events_query_advanced` | Elasticsearch search over events | **query** (search body), scroll, verbose |
 | `saas_alerts_events_count_advanced` | Count events matching an Elasticsearch query | **query** |
 | `saas_alerts_events_scroll` | Next page of a scrolled search | **scroll_id**, scroll (default `1m`), verbose |
-| `saas_alerts_recommended_actions` | Recommended response per event type | - |
-| `saas_alerts_customers_list` | List customers | - |
+| `saas_alerts_recommended_actions` | Recommended response per event type | event_type, offset, limit |
+| `saas_alerts_customers_list` | List customers | offset, limit |
 | `saas_alerts_customers_get` | One customer | **customer_id** |
 | `saas_alerts_customers_create` | Create a customer (**write**) | **body** {**name**, email} |
 | `saas_alerts_customers_update` | Change a customer's name / email (**write**) | **customer_id**, **body** {name, email} |
